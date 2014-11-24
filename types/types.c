@@ -35,6 +35,8 @@
 #include <glib.h>
 #include <errno.h>
 
+static __thread GHashTable *quark_cache = NULL;
+
 static
 GQuark prefix_quark(const char *prefix, GQuark quark)
 {
@@ -620,7 +622,18 @@ struct bt_definition *bt_lookup_definition(const struct bt_definition *definitio
 	if (!scope)
 		return NULL;
 
-	return lookup_field_definition_scope(g_quark_from_string(field_name),
+	if (!quark_cache) {
+		quark_cache = g_hash_table_new(g_str_hash, g_str_equal);
+	}
+
+	GQuark quark;
+	quark = GPOINTER_TO_UINT(g_hash_table_lookup(quark_cache, field_name));
+	if (unlikely(!quark)) {
+		quark = g_quark_from_string(field_name);
+		g_hash_table_insert(quark_cache, field_name, GUINT_TO_POINTER(quark));
+	}
+
+	return lookup_field_definition_scope(quark,
 					     scope);
 }
 
