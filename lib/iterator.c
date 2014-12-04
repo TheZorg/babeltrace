@@ -369,7 +369,7 @@ int bt_iter_set_pos(struct bt_iter *iter, const struct bt_iter_pos *iter_pos)
 		if (!iter_pos->u.restore)
 			return -EINVAL;
 
-		bt_heap_free(iter->stream_heap);
+        bt_heap_free(iter->stream_heap);
 		ret = bt_heap_init(iter->stream_heap, 0, stream_compare);
 		if (ret < 0)
 			goto error_heap_init;
@@ -429,34 +429,60 @@ int bt_iter_set_pos(struct bt_iter *iter, const struct bt_iter_pos *iter_pos)
 	case BT_SEEK_TIME:
 		tc = iter->ctx->tc;
 
-		bt_heap_free(iter->stream_heap);
-		ret = bt_heap_init(iter->stream_heap, 0, stream_compare);
-		if (ret < 0)
-			goto error_heap_init;
+        struct ctf_file_stream *file_stream;
+        struct ptr_heap *new_heap = malloc(sizeof(struct ptr_heap));
+        ret = bt_heap_init(new_heap, 0, stream_compare);
+        if (ret < 0)
+            goto error_heap_init;
 
-		/* for each trace in the trace_collection */
-		for (i = 0; i < tc->array->len; i++) {
-			struct ctf_trace *tin;
-			struct bt_trace_descriptor *td_read;
+        while((file_stream = bt_heap_remove(iter->stream_heap)) != NULL) {
+            ret = seek_file_stream_by_timestamp(file_stream, iter_pos->u.seek_time);
+            if (ret == 0) {
+                /* Add to heap */
+                ret = bt_heap_insert(new_heap, file_stream);
+                if (ret < 0) {
+                    /* Return positive error. */
+                    goto error;
+                }
+            } else if (ret > 0) {
+                /*
+                 * Error in seek (not EOF), failure.
+                 */
+                goto error;
+            }
+        }
 
-			td_read = g_ptr_array_index(tc->array, i);
-			if (!td_read)
-				continue;
-			tin = container_of(td_read, struct ctf_trace, parent);
+        bt_heap_free(iter->stream_heap);
+        iter->stream_heap = new_heap;
 
-			ret = seek_ctf_trace_by_timestamp(tin,
-					iter_pos->u.seek_time,
-					iter->stream_heap);
-			/*
-			 * Positive errors are failure. Negative value
-			 * is EOF (for which we continue with other
-			 * traces). 0 is success. Note: on EOF, it just
-			 * means that no stream has been added to the
-			 * iterator for that trace, which is fine.
-			 */
-			if (ret != 0 && ret != EOF)
-				goto error;
-		}
+//		bt_heap_free(iter->stream_heap);
+//		ret = bt_heap_init(iter->stream_heap, 0, stream_compare);
+//		if (ret < 0)
+//			goto error_heap_init;
+
+//		/* for each trace in the trace_collection */
+//		for (i = 0; i < tc->array->len; i++) {
+//			struct ctf_trace *tin;
+//			struct bt_trace_descriptor *td_read;
+
+//			td_read = g_ptr_array_index(tc->array, i);
+//			if (!td_read)
+//				continue;
+//			tin = container_of(td_read, struct ctf_trace, parent);
+
+//			ret = seek_ctf_trace_by_timestamp(tin,
+//					iter_pos->u.seek_time,
+//					iter->stream_heap);
+//			/*
+//			 * Positive errors are failure. Negative value
+//			 * is EOF (for which we continue with other
+//			 * traces). 0 is success. Note: on EOF, it just
+//			 * means that no stream has been added to the
+//			 * iterator for that trace, which is fine.
+//			 */
+//			if (ret != 0 && ret != EOF)
+//				goto error;
+//		}
 		return 0;
 	case BT_SEEK_BEGIN:
 		tc = iter->ctx->tc;
@@ -664,6 +690,152 @@ static int babeltrace_filestream_seek(struct ctf_file_stream *file_stream,
 	return ret;
 }
 
+static
+struct ctf_event_definition *create_event_definitions(struct ctf_trace *td,
+                          struct ctf_stream_definition *stream,
+                          struct ctf_event_declaration *event)
+{
+    struct ctf_event_definition *stream_event = g_new0(struct ctf_event_definition, 1);
+
+    if (event->context_decl) {
+        struct bt_definition *definition =
+            event->context_decl->p.definition_new(&event->context_decl->p,
+                stream->parent_def_scope, 0, 0, "event.context");
+        if (!definition) {
+            goto error;
+        }
+        stream_event->event_context = container_of(definition,
+                    struct definition_struct, p);
+        stream->parent_def_scope = stream_event->event_context->p.scope;
+    }
+    if (event->fields_decl) {
+        struct bt_definition *definition =
+            event->fields_decl->p.definition_new(&event->fields_decl->p,
+                stream->parent_def_scope, 0, 0, "event.fields");
+        if (!definition) {
+            goto error;
+        }
+        stream_event->event_fields = container_of(definition,
+                    struct definition_struct, p);
+        stream->parent_def_scope = stream_event->event_fields->p.scope;
+    }
+    stream_event->stream = stream;
+    return stream_event;
+
+error:
+    if (stream_event->event_fields)
+        bt_definition_unref(&stream_event->event_fields->p);
+    if (stream_event->event_context)
+        bt_definition_unref(&stream_event->event_context->p);
+    fprintf(stderr, "[error] Unable to create event definition for event \"%s\".\n",
+        g_quark_to_string(event->name));
+    return NULL;
+}
+
+static
+int copy_event_declarations_stream_class_to_stream(struct ctf_trace *td,
+        struct ctf_stream_declaration *stream_class,
+        struct ctf_stream_definition *stream)
+{
+    size_t def_size, class_size, i;
+    int ret = 0;
+
+    def_size = stream->events_by_id->len;
+    class_size = stream_class->events_by_id->len;
+
+    g_ptr_array_set_size(stream->events_by_id, class_size);
+    for (i = def_size; i < class_size; i++) {
+        struct ctf_event_declaration *event =
+            g_ptr_array_index(stream_class->events_by_id, i);
+        struct ctf_event_definition *stream_event;
+
+        if (!event)
+            continue;
+        stream_event = create_event_definitions(td, stream, event);
+        if (!stream_event) {
+            ret = -EINVAL;
+            goto error;
+        }
+        g_ptr_array_index(stream->events_by_id, i) = stream_event;
+    }
+error:
+    return ret;
+}
+
+static
+int create_stream_definitions(struct ctf_trace *td, struct ctf_stream_definition *stream)
+{
+    struct ctf_stream_declaration *stream_class;
+    int ret;
+    int i;
+
+    if (stream->stream_definitions_created)
+        return 0;
+
+    stream_class = stream->stream_class;
+
+    if (stream_class->packet_context_decl) {
+        struct bt_definition *definition =
+            stream_class->packet_context_decl->p.definition_new(&stream_class->packet_context_decl->p,
+                stream->parent_def_scope, 0, 0, "stream.packet.context");
+        if (!definition) {
+            ret = -EINVAL;
+            goto error;
+        }
+        stream->stream_packet_context = container_of(definition,
+                        struct definition_struct, p);
+        stream->parent_def_scope = stream->stream_packet_context->p.scope;
+    }
+    if (stream_class->event_header_decl) {
+        struct bt_definition *definition =
+            stream_class->event_header_decl->p.definition_new(&stream_class->event_header_decl->p,
+                stream->parent_def_scope, 0, 0, "stream.event.header");
+        if (!definition) {
+            ret = -EINVAL;
+            goto error;
+        }
+        stream->stream_event_header =
+            container_of(definition, struct definition_struct, p);
+        stream->parent_def_scope = stream->stream_event_header->p.scope;
+    }
+    if (stream_class->event_context_decl) {
+        struct bt_definition *definition =
+            stream_class->event_context_decl->p.definition_new(&stream_class->event_context_decl->p,
+                stream->parent_def_scope, 0, 0, "stream.event.context");
+        if (!definition) {
+            ret = -EINVAL;
+            goto error;
+        }
+        stream->stream_event_context =
+            container_of(definition, struct definition_struct, p);
+        stream->parent_def_scope = stream->stream_event_context->p.scope;
+    }
+    stream->events_by_id = g_ptr_array_new();
+    ret = copy_event_declarations_stream_class_to_stream(td,
+            stream_class, stream);
+    if (ret)
+        goto error_event;
+    return 0;
+
+error_event:
+    for (i = 0; i < stream->events_by_id->len; i++) {
+        struct ctf_event_definition *stream_event = g_ptr_array_index(stream->events_by_id, i);
+        if (stream_event)
+            g_free(stream_event);
+    }
+    g_ptr_array_free(stream->events_by_id, TRUE);
+error:
+    if (stream->stream_event_context)
+        bt_definition_unref(&stream->stream_event_context->p);
+    if (stream->stream_event_header)
+        bt_definition_unref(&stream->stream_event_header->p);
+    if (stream->stream_packet_context)
+        bt_definition_unref(&stream->stream_packet_context->p);
+    fprintf(stderr, "[error] Unable to create stream (%" PRIu64 ") definitions: %s\n",
+        stream_class->stream_id, strerror(-ret));
+    return ret;
+}
+
 int bt_iter_add_trace(struct bt_iter *iter,
 		struct bt_trace_descriptor *td_read)
 {
@@ -683,13 +855,21 @@ int bt_iter_add_trace(struct bt_iter *iter,
 			continue;
 		for (filenr = 0; filenr < stream->streams->len;
 				filenr++) {
-			struct ctf_file_stream *file_stream;
-			struct bt_iter_pos pos;
-
-			file_stream = g_ptr_array_index(stream->streams,
-					filenr);
-			if (!file_stream)
-				continue;
+#if(1)
+            struct ctf_file_stream *file_stream = malloc(sizeof(struct ctf_file_stream));
+            struct ctf_file_stream *file_stream_orig = g_ptr_array_index(stream->streams, filenr);
+            struct bt_iter_pos pos;
+            memcpy(file_stream, file_stream_orig, sizeof(struct ctf_file_stream));
+            file_stream->pos.base_mma = NULL;
+            create_stream_definitions(tin, &file_stream->parent);
+#else
+            struct ctf_file_stream *file_stream;
+            struct ctf_file_stream *file_stream_orig = g_ptr_array_index(stream->streams, filenr);
+            struct bt_iter_pos pos;
+            file_stream = file_stream_orig;
+#endif
+            if (!file_stream)
+                continue;
 
 			pos.type = BT_SEEK_BEGIN;
 			ret = babeltrace_filestream_seek(file_stream,
@@ -723,10 +903,10 @@ int bt_iter_init(struct bt_iter *iter,
 	if (!iter || !ctx)
 		return -EINVAL;
 
-	if (ctx->current_iterator) {
-		ret = -1;
-		goto error_ctx;
-	}
+//	if (ctx->current_iterator) {
+//		ret = -1;
+//		goto error_ctx;
+//	}
 
 	iter->stream_heap = g_new(struct ptr_heap, 1);
 	iter->end_pos = end_pos;
