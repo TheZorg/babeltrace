@@ -38,6 +38,21 @@
 static __thread GHashTable *quark_cache = NULL;
 
 static
+GQuark get_quark_from_string_cache(char *quark_str)
+{
+    GQuark quark;
+    if (!quark_cache) {
+        quark_cache = g_hash_table_new(g_str_hash, g_str_equal);
+    }
+    quark = GPOINTER_TO_UINT(g_hash_table_lookup(quark_cache, quark_str));
+    if (!quark) {
+        quark = g_quark_from_string(quark_str);
+        g_hash_table_insert(quark_cache, strdup(quark_str), GUINT_TO_POINTER(quark));
+    }
+    return quark;
+}
+
+static
 GQuark prefix_quark(const char *prefix, GQuark quark)
 {
 	GQuark nq;
@@ -47,7 +62,7 @@ GQuark prefix_quark(const char *prefix, GQuark quark)
 	str = g_string_new(prefix);
 	g_string_append(str, g_quark_to_string(quark));
 	quark_str = g_string_free(str, FALSE);
-	nq = g_quark_from_string(quark_str);
+    nq = get_quark_from_string_cache(quark_str);
 	g_free(quark_str);
 	return nq;
 }
@@ -535,7 +550,7 @@ GQuark bt_new_definition_path(struct definition_scope *parent_scope,
 	c_str = g_string_free(str, FALSE);
 	if (c_str[0] == '\0')
 		return 0;
-	path = g_quark_from_string(c_str);
+    path = get_quark_from_string_cache(c_str);
 	printf_debug("new definition path: %s\n", c_str);
 	g_free(c_str);
 	return path;
@@ -595,14 +610,14 @@ void bt_append_scope_path(const char *path, GArray *q)
 		str = g_new(char, len + 1);	/* include \0 */
 		memcpy(str, ptrbegin, len);
 		str[len] = '\0';
-		quark = g_quark_from_string(str);
+        quark = get_quark_from_string_cache(str);
 		g_array_append_val(q, quark);
 		g_free(str);
 		ptrend++;	/* skip current dot */
 	}
 	/* last. Check for trailing dot (and discard). */
 	if (ptrbegin[0] != '\0') {
-		quark = g_quark_from_string(ptrbegin);
+        quark = get_quark_from_string_cache(ptrbegin);
 		g_array_append_val(q, quark);
 	}
 }
@@ -627,12 +642,7 @@ struct bt_definition *bt_lookup_definition(const struct bt_definition *definitio
 	}
 
 	GQuark quark;
-	quark = GPOINTER_TO_UINT(g_hash_table_lookup(quark_cache, field_name));
-	if (unlikely(!quark)) {
-		quark = g_quark_from_string(field_name);
-		g_hash_table_insert(quark_cache, field_name, GUINT_TO_POINTER(quark));
-	}
-
+    quark = get_quark_from_string_cache(field_name);
 	return lookup_field_definition_scope(quark,
 					     scope);
 }
@@ -667,7 +677,7 @@ struct definition_enum *bt_lookup_enum(const struct bt_definition *definition,
 		return NULL;
 	if (lookup->declaration->id != CTF_TYPE_ENUM)
 		return NULL;
-	lookup_enum = container_of(lookup, struct definition_enum, p);
+    lookup_enum = container_of(lookup, struct definition_enum, p);
 	if (lookup_enum->integer->declaration->signedness != signedness)
 		return NULL;
 	return lookup_enum;
